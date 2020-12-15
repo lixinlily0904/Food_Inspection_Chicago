@@ -1,0 +1,824 @@
+---
+title: "MUSA 508 FINAL"
+author: "Jin Yiming & Xin Li"
+date: "Dec 2020"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+Introduction:
+
+In order to help the Public Health Administration in Chicago to quickly find public health issues, reactive checks (i.e. responding to complaints), renew or receive food licenses, and improve the allocation of limited food inspection resources. We would like to recommend this model to predict the inspection results and provide a priority for later inspection. The prediction model refers to both micro-scale data such as the past inspection results as well as macro-scale data such as demographic data and public health complaints.  
+
+In the end, We would like to create a database of the predicted results and an app for the Public Health Administration, with which the inspectors can place a priority among the sites and check up the past inspection results. The Public Health Administration can also sell the API of their database to others (such as Yelp) to create revenue. 
+
+Youtube link:
+
+
+# 1. Set up
+
+Install libraries
+
+```{r load_packages, message=FALSE, warning = FALSE, results=FALSE}
+options(scipen=10000000)
+
+library(tidyverse)
+library(kableExtra)
+library(caret)
+library(knitr) 
+library(pscl)
+library(plotROC)
+library(pROC)
+library(lubridate)
+library(ggcorrplot)
+library(ggplot2)
+library(sf)
+library(viridis)
+library(spatstat)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(tidycensus)
+library(RSocrata)
+library(ckanr)
+library(jtools)
+library(stargazer)
+library(lubridate)
+
+# functions
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+```
+
+Load Styling options
+
+```{r style, message=FALSE, warning=FALSE,results=FALSE}
+options(scipen=999)
+options(tigris_class = "sf")
+
+mapTheme <- function(base_size = 12) {
+  theme(
+    text = element_text( color = "black"),
+    plot.title = element_text(size = 16,colour = "black"),
+    plot.subtitle=element_text(face="italic"),
+    plot.caption=element_text(hjust=0),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, size=2),
+    strip.text.x = element_text(size = 14))
+}
+
+plotTheme <- function(base_size = 12) {
+  theme(
+    text = element_text( color = "black"),
+    plot.title = element_text(size = 16,colour = "black"),
+    plot.subtitle = element_text(face="italic"),
+    plot.caption = element_text(hjust=0),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),
+    panel.grid.major = element_line("grey80", size = 0.1),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, size=2),
+    strip.background = element_rect(fill = "grey80", color = "white"),
+    strip.text = element_text(size=12),
+    axis.title = element_text(size=12),
+    axis.text = element_text(size=10),
+    plot.background = element_blank(),
+    legend.background = element_blank(),
+    legend.title = element_text(colour = "black", face = "italic"),
+    legend.text = element_text(colour = "black", face = "italic"),
+    strip.text.x = element_text(size = 14)
+  )
+}
+```
+
+Load Quantile break functions
+
+```{r message=FALSE, warning=FALSE,results=FALSE}
+
+qBr <- function(df, variable, rnd) {
+  if (missing(rnd)) {
+    as.character(quantile(round(df[[variable]],2),
+                          c(.01,.2,.4,.6,.8), na.rm=T))
+  } else if (rnd == FALSE | rnd == F) {
+    as.character(formatC(quantile(df[[variable]]), digits = 3),
+                 c(.01,.2,.4,.6,.8), na.rm=T)
+  }
+}
+
+q5 <- function(variable) {as.factor(ntile(variable, 5))}
+```
+
+Load hexadecimal color palette
+
+```{r message=FALSE, warning=FALSE,results=FALSE}
+palette5 <- c("#f0f9e8","#bae4bc","#7bccc4","#43a2ca","#0868ac")
+palette2 <- c("#981FAC","#FF006A") 
+```
+
+Load census API key
+
+```{r message=FALSE, warning=FALSE,results=FALSE}
+census_api_key("15aafa6c332f6123073c2927ac6cdf9dc6c92893", install = T, overwrite = T)
+```
+
+Read in ChicagO boundary data
+
+```{r Chicago_map, message=FALSE, warning=FALSE}
+chicagoBoundary <- 
+  st_read(file.path(root.dir,"/Chapter5/chicagoBoundary.geojson")) %>%
+  st_transform('ESRI:102271') 
+```
+
+# 2. Tidy up food inspection data
+
+We would like to tidy up the raw data of food inspection before we go further. The inspection results do not fall into binary results of Pass/ Fail. We need to recategorize the inspection results into either Fail or Pass. 
+
+## 2.1 read in Food inspection data 
+
+```{r read_basedata, message=FALSE, warning=FALSE}
+
+foodinspection <- 
+  read.socrata("https://data.cityofchicago.org/resource/4ijn-s7e5.csv") %>%
+  mutate(X = as.numeric(latitude),
+         Y = as.numeric(longitude)) %>% 
+  filter(!is.na(X)) %>%
+  filter(!is.na(Y)) %>%  st_as_sf(coords = c("Y", "X"), crs = 4326, agr = "constant")  %>%
+  st_transform('ESRI:102271') 
+
+ggplot() + 
+   geom_sf(data= chicagoBoundary)+
+   geom_sf(data= foodinspection) +
+   labs(title = "Food Inspection distribution", subtitle = "Chicago, IL", caption="Figure 1") +
+   mapTheme() 
+
+```
+
+The raw data record tons of inspections from 2010 to 2020.
+
+## 2.2 Tidy up P/F results
+
+We consider "Pass" and "Pass with conditions" as PASS, consider Fail as FAIL. We exclude "No Entry", "Not Ready", and "Out of Business" because we have no idea whether they are PASS or FAIL. We mark PASS as 1 and Fail (No PASS) as 0.
+
+```{r tidyup_P/F, message=FALSE, warning=FALSE}
+# restaurantinspection <- foodinspection%>%
+#   dplyr::filter(facility_type == "Restaurant")
+
+table1 <- foodinspection%>%
+  dplyr::filter(results=="Fail"| results=="Pass"| results=="Pass w/ Conditions")%>%
+  mutate(binary_results = as.numeric(ifelse(results == "Fail", 0, 1)))
+```
+
+# 3. Indicators
+
+We would like to predict the 2020 inspection data based on indicators from both micro-scale and macro scale.
+Micro-scale: Past inspection data
+Macro-scale: Census tract data, 311 Request data
+
+
+## 3.1 Past Inspection data
+
+### 3.1.1 Create indicators: "Pass rate" and "First time inspection" 
+
+We would like to create two features from the past inspection results:
+
+First, we assume that the higher the pass rate a site has, the more likely it fails the 2020 inspection. So we would like to use "PASS RATE = (number of PASS in the inspections)/ (total number of inspection) " as one of our indicators.
+
+What is more, we notice that the sites that have no inspection before are more likely to fail than the sites that have been inspected before, so we would like to use "FIRST TIME INSPECTION (Yes as 1, No as 0)" to be one of our indicators. 
+
+To create such two indicators, we start off by marking the sites that have not been inspected before.
+
+```{r count, message=FALSE, warning=FALSE}
+table1_2 <- table1 %>% 
+  group_by(dba_name,binary_results) %>%
+  summarize(counts1 = n()) %>%
+  dplyr::filter(binary_results == 1) %>%
+  st_drop_geometry()
+  
+table1_3 <- table1 %>%
+  group_by(dba_name) %>%
+  summarize(counts = n()) %>%
+  st_drop_geometry()
+
+table1 <- table1 %>%
+  left_join(table1_2[,-2], by ="dba_name")  %>%
+  left_join(table1_3, by ="dba_name") 
+
+table1[is.na(table1)] <- 0
+```
+
+We can calculate the ratio of pass and decide if it is the first time inspection. 
+
+```{r ratio, message=FALSE, warning=FALSE}
+table1 <- table1 %>%
+  mutate(ratio_pass = table1$counts1/ table1$counts) %>%
+  mutate(first_time = as.factor(ifelse(counts == 1, 1, 0)))
+```
+
+### 3.1.2 Select the 2020 data. 
+
+We select the 2020 data for later prediction. There is more than one inspection for some of the sites in 2020, we contain all the inspection data because we find the results are extremely unbalanced if only choose the latest inspection results. 
+
+```{r message=FALSE, warning=FALSE}
+# library(lubridate)
+# introduction about the package: https://zhuanlan.zhihu.com/p/27612862
+
+table1$month <- month(table1$inspection_date)
+table1$year <- year(table1$inspection_date)
+table2 <- table1 %>% filter(year == 2020)
+```
+
+
+## 3.2 Census data
+
+We would like to take census tract data into consideration. We would like to check if demographic data such as race and income will influence the food safety.  
+
+### 3.2.1 Read in Census data
+
+Read in Chicago census data and select the raw demographic data. 
+
+```{r Chicago_census, message=FALSE, warning=FALSE,results=FALSE}
+tract18 <- 
+  get_acs(geography = "tract", variables = c("B25026_001E","B02001_002E","B15001_050E",
+                                             "B15001_009E","B19013_001E","B25058_001E",
+                                             "B06012_002E"), 
+          year = 2018, state=17, county=031, geometry=T) %>%
+  st_transform('ESRI:102271') 
+
+mask <- 
+  filter(chicagoBoundary) %>%
+  st_centroid() %>%
+  st_buffer(5280 * 5)
+  
+tract18 <- 
+  tract18[mask,]
+
+```
+
+Reshape long data to wide data
+
+```{r message=FALSE, warning=FALSE}
+tract18Wide <- 
+  tract18 %>%
+  dplyr::select( -NAME, -moe) %>%
+  spread(variable, estimate) %>%
+  dplyr::select(-geometry) %>%
+  rename(TotalPop = B25026_001, 
+         Whites = B02001_002,
+         FemaleBachelors = B15001_050, 
+         MaleBachelors = B15001_009,
+         MedHHInc = B19013_001, 
+         MedRent = B25058_001,
+         TotalPoverty = B06012_002)
+```
+
+Calculate demographic features in each tracts, including percentage of white, percentage of bachelors,percentage of proverty
+
+```{r message=FALSE, warning=FALSE}
+tract18Wide <- 
+  tract18Wide %>%
+  mutate(pctWhite = ifelse(TotalPop > 0, Whites / TotalPop, 0),
+         pctBachelors = ifelse(TotalPop > 0, ((FemaleBachelors + MaleBachelors) / TotalPop), 0),
+         pctPoverty = ifelse(TotalPop > 0, TotalPoverty / TotalPop, 0),
+         year = "2018") %>%
+  dplyr::select(-Whites,-FemaleBachelors,-MaleBachelors,-TotalPoverty)
+
+st_drop_geometry(tract18Wide)[1:3,]
+```
+
+### 3.2.2 visualize the demographic data
+
+Population
+
+```{r}
+ggplot(tract18Wide)+
+    geom_sf(aes(fill = q5(TotalPop))) +
+    scale_fill_manual(values = palette5,
+                      labels = qBr(tract18Wide, "TotalPop"),
+                      name = "TotalPop\n(Quintile Breaks)") +
+    labs(title = "Population", subtitle = "Chicago, IL", caption="Figure 2") +
+    mapTheme() + 
+    theme(plot.title = element_text(size=16))
+```
+
+Percentage of Whiite
+
+```{r message=FALSE, warning=FALSE}
+ggplot(tract18Wide)+
+    geom_sf(aes(fill = q5(pctWhite))) +
+    scale_fill_manual(values = palette5,
+                      labels = qBr(tract18Wide, "pctWhite"), 
+                      name = "Percentage of Whiite\n(Quintile Breaks)") +
+    labs(title = "Percentage of Whiite", subtitle = "Chicago, IL", caption="Figure 3") +
+     mapTheme() + 
+    theme(plot.title = element_text(size=16))
+```
+
+Percentage of Poverty
+
+```{r message=FALSE, warning=FALSE}
+ggplot(tract18Wide)+
+    geom_sf(aes(fill = q5(pctPoverty))) +
+    scale_fill_manual(values = palette5,
+                      labels = qBr(tract18Wide, "pctPoverty"),
+                      name = "Percentage of Poverty\n(Quintile Breaks)") +
+    labs(title = "Percentage of Poverty", subtitle = "Chicago, IL", caption="Figure 4") +
+    mapTheme() + 
+    theme(plot.title = element_text(size=16))
+```
+  
+### 3.2.3 Feature engineering - spatial join
+
+Spatial join the census data to the inspection data by st_within
+
+```{r Spatial_join, message=FALSE, warning=FALSE}
+table2 <- st_join(table2, tract18Wide[,-8] , join = st_within) %>%
+  st_drop_geometry() %>%
+  left_join(table2)%>%
+  st_sf()
+```
+
+## 3.3 Other data to show potential of P/F
+
+We would like to take some other macro-scale data into consideration - to see if they can help to illustrate some of the latent risks causing FAIL. Here we import the public health request data including sanitation code complaints and rodent baiting data. 
+
+
+### 3.3.1 Import data
+
+311 Request data - Sanitation Code Complaints
+
+-- The dataset records open sanitation code complaints made to 311 and all requests completed since January 1, 2011 -- Residents may request service for violations such as overflowing dumpsters and garbage in the alley. We consider that a higher density of sanitation code complaints may indicate a worse sanitation, which may lead to a higher potential to fail the inspection.
+
+```{r Chicago_Sanitation_Complaints, message=FALSE, warning=FALSE,results=FALSE}
+# https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Sanitation-Code-Complaints-No/rccf-5427
+
+sanitation <- st_read("https://data.cityofchicago.org/resource/rccf-5427.geojson") %>%
+  st_transform('ESRI:102271') 
+```
+
+Visualize the distribution of Sanitation Code Complaints
+
+```{r Dens_of_Sanitation_code_complaints, warning=FALSE, fig.width=9.5, fig.height=4}
+grid.arrange(ncol=2,
+ggplot() + 
+  geom_sf(data = chicagoBoundary) +
+  geom_sf(data = sanitation, colour="red", size=0.1, show.legend = "point") +
+  labs(title= "Sanitation Code Complaints"), 
+
+ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "grey40") +
+  stat_density2d(data = data.frame(st_coordinates(st_centroid(sanitation))), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis() +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(title = "Density of Sanitation Code Complaints", caption="Figure 5") +
+  theme(legend.position = "none"))
+```
+
+311 Request data - Rodent Baiting
+
+— The dataset records the open rodent baiting requests and rat complaints made to 311 and all requests completed since January 1, 2011. We consider that a higher density of Rodent baiting comlaints may indicate a worse sanitation, which may lead to a higher potential to fail the inspection.
+
+```{r, message=FALSE, warning=FALSE,results=FALSE}
+# https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Rodent-Baiting-No-Duplicates/uqhs-j723
+rodent <- st_read("https://data.cityofchicago.org/resource/uqhs-j723.geojson")%>%
+  st_transform('ESRI:102271') 
+
+```
+
+Visualize the distribution of Rodent Baiting Requests
+
+```{r Dens_Rodent_Baiting, warning=FALSE, fig.width=9.5, fig.height=4}
+grid.arrange(ncol=2,
+ggplot() + 
+  geom_sf(data = chicagoBoundary) +
+  geom_sf(data = rodent, colour="red", size=0.1, show.legend = "point") +
+  labs(title= "Rodent Baiting"),
+
+ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "grey40") +
+  stat_density2d(data = data.frame(st_coordinates(st_centroid(rodent))), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis() +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(title = "Density of Rodent Baiting", caption="Figure 6") + 
+  theme(legend.position = "none"))
+```
+
+### 3.3.2 Feature engineering -knn
+
+We use knn to calculate how "close" it is from the request sites to the inspection points
+
+```{r message=FALSE, warning=FALSE,results=FALSE}
+st_c <- st_coordinates
+
+table2<-
+ table2 %>% 
+    mutate(
+      sanitation_nn1 = nn_function(st_c(st_centroid(table2)), st_c(st_centroid(sanitation)), 1),
+      sanitation_nn2 = nn_function(st_c(st_centroid(table2)), st_c(st_centroid(sanitation)), 2),
+      sanitation_nn3 = nn_function(st_c(st_centroid(table2)), st_c(st_centroid(sanitation)), 3))
+
+table2<-
+ table2 %>% 
+    mutate(
+      rodent_nn1 = nn_function(st_c(st_centroid(table2)), st_c(st_centroid(rodent)), 1),
+      rodent_nn2 = nn_function(st_c(st_centroid(table2)), st_c(st_centroid(rodent)), 2),
+      rodent_nn3 = nn_function(st_c(st_centroid(table2)), st_c(st_centroid(rodent)), 3))
+
+```
+
+# 4 Data Exploration & Interpretation
+
+We would like to list all the variables we have for the 2020 data below:
+
+```{r all_varibles, message=FALSE, warning=FALSE}
+names(table2)
+```
+
+Then we would like to select the relevant features in the chart. We will examine the numeric features and the categorical features below.
+
+## 4.1 Numeric features
+
+We would like to do correlation analysis for the numeric features. 
+
+```{r Cor, warning=FALSE,fig.width=12, fig.height=5.5}
+numericVars <- 
+  select_if(table2, is.numeric) %>% 
+  na.omit()%>% 
+  st_drop_geometry()
+  
+ggcorrplot(
+  round(cor(numericVars), 1), 
+  p.mat = cor_pmat(numericVars),
+  colors = c("#25CB10", "white", "#FA7800"),
+  type="lower",
+  insig = "blank") +  
+    labs(title = "Correlation across numeric variables") 
+```
+
+From the correlation results, the binary results (P/F) are closely relevant to the ratio of pass. They seems also relevant to some macro-scare data such as the Medient Rent. The results of rodent requests and the sanitation complaints are highly correlated, and we would not like to use more than one features among the six for the model.    
+
+```{r Charts, warning=FALSE, fig.width=9.5, fig.height=4}
+table2 %>% st_drop_geometry() %>%
+  dplyr::select(binary_results, ratio_pass, sanitation_nn1,  MedHHInc, TotalPop, MedRent, pctWhite, pctBachelors, pctPoverty, sanitation_nn2, sanitation_nn3, rodent_nn1, rodent_nn2,rodent_nn3) %>%
+   gather(Variable, value, - binary_results) %>%
+   ggplot() +     
+   geom_density(aes(value, color= as.character(binary_results)), fill = "transparent") + 
+   facet_wrap(~Variable, scales = "free") +
+   scale_fill_manual(values = palette2) +
+   labs(title = "Feature distributions with Pass/ Fail",
+        subtitle = "continous outcomes") +
+    theme(legend.position = "none")
+```
+
+As we can see, the pass rate (ratio_pass) largely influence the inspection results. Some features, such as the percentage of poverty, may have a larger influence on the results with in a certain threshold, and we may re-categorize these features later. 
+
+
+## 4.2 Category features
+
+We create P/F bar charts for category features. 
+
+```{r Charts_binary, fig.width= 20, fig.height=4}
+table2 %>% st_drop_geometry() %>%
+    dplyr::select(risk,binary_results,GEOID,facility_type) %>%
+    gather(Variable, value, - binary_results) %>%
+    count(Variable, value, binary_results) %>%
+      ggplot(., aes(value, n, fill = as.factor(binary_results))) +   
+        geom_bar(position = "dodge", stat="identity") +
+        facet_wrap(~Variable, scales="free") +
+        scale_fill_manual(values = palette2) +
+        labs(x="Take the credit or not", y="Value",
+             title = "Feature distributions with Pass/ Fail",
+             subtitle = "Categorical features") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 4.3 Feature engineering
+
+We re-categorize some of the features according to the analysis above. 
+
+```{r feature_engineering, message=FALSE, warning=FALSE,results=FALSE}
+
+table2 <- table2  %>%
+  mutate (pctProverty_Cat =
+            case_when(pctPoverty >= 0.16 ~ "High",
+                      pctPoverty < 0.16  ~ "Low" ))  
+
+```
+      
+# 5 Predict the P/F results with Logistic Regression Model
+
+We would like to use a logistic regression model with the data in chart. The predicted results will fall into either PASS (1) or FAIL (NO PASS, 0)。
+
+## 5.1 Split the data into Train set & Test set
+
+```{r split, message=FALSE, warning=FALSE,results=FALSE}
+set.seed(3465)
+trainIndex <- createDataPartition(table2$binary_results,y = paste(table2$GEOID),p = .70,
+                                  list = FALSE, times = 1) 
+
+# trainIndex <- createDataPartition(table2$binary_results,y = paste(table2$GEOID),p = .65,
+#                                  list = FALSE, times = 1) 
+        
+datTrain <- table2[ trainIndex,] %>% st_drop_geometry()
+datTest  <- table2[-trainIndex,] %>% st_drop_geometry()
+```
+
+## 5.2 Create Logistic Regression model
+
+We create logistic regression model by macro-scale and micro-scale data. 
+
+```{r model, message=FALSE, warning=FALSE}
+Model_01 <- glm(datTrain$binary_results ~ .,
+                  data= datTrain %>% 
+                  dplyr::select(risk,ratio_pass,first_time, MedHHInc,MedRent,sanitation_nn3,pctWhite),
+                  family="binomial" (link="logit"))
+
+summary(Model_01)
+```
+
+From the summarized results, most of the factors in the model have shown kind of statistic significance.
+
+```{r model_results_01, message=FALSE, warning=FALSE}
+summ(Model_01)
+```
+
+```{r model_results_02, message=FALSE, warning=FALSE,results=FALSE}
+pR2(Model_01)
+```
+
+## 5.3 Make predictions
+
+Then we the train model to predict the inspection results in the test set. 
+
+```{r model_predict, message=FALSE, warning=FALSE,results=FALSE}
+
+Pred_01 <- data.frame(Outcome = as.factor(datTest$binary_results),
+                        Probs = predict(Model_01, datTest, type= "response"))
+```
+
+# 6.Model validation
+
+We would like to examine the accuracy (sensitivity and specificity), ROC Curve and Cross validation.
+
+## 6.1 Accuracy (Sensitivity and Specificity)
+
+```{r predicted_results, message=FALSE, warning=FALSE,results=FALSE}
+ggplot(Pred_01, aes(x = Probs, fill = as.factor(Outcome))) + 
+  geom_density() +
+  facet_grid(Outcome ~ .) +
+  scale_fill_manual(values = palette2) +
+  labs(x = "Take the credit or not", y = "Density of probabilities",
+       title = "Distribution of predicted probabilities by observed outcome") +
+  theme(strip.text.x = element_text(size = 18),
+        legend.position = "none")
+```
+
+The second graph (PASS,1) cluster around 1, while the first graph (Fail, 0) fails to cluster around 0, which means that the modal may not be so predictive (a low sensitivity) when using a default threshold. 
+
+We modify the threshold from 0.5 to 0.77 and create a confusion matrix as below:
+
+```{r compare, message=FALSE, warning=FALSE}
+Pred_01 <- 
+  Pred_01 %>%
+  mutate(predOutcome  = as.factor(ifelse(Pred_01$Probs > 0.77 , 1, 0)))
+
+caret::confusionMatrix(Pred_01$predOutcome, Pred_01$Outcome, 
+                       positive = "1")
+```
+
+As we see from the confusion matrix results, the sensitivity is around 0.69 and the specificity is around 0.65, and the accuracy is around 0.68. The model can make a balance between sensitivity and specificity with the 0.77 thresholds. 
+
+## 6.2 ROC Curve
+
+```{r roc_Curve, message=FALSE, warning=FALSE,results=FALSE}
+ggplot(Pred_01, aes(d = as.numeric(Pred_01$Outcome), m = Probs)) +
+  geom_roc(n.cuts = 50, labels = FALSE, colour = "#FE9900") +
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') +
+  labs(title = "ROC Curve - clickModel")
+```
+
+The ROC Curve visualizing trade-offs for two important confusion metrics. 
+
+According to the ROC Curve, a threshold that predicts “Pass the inspection” correctly 75% of the time, will predict “Pass the inspection” incorrectly about 37% of the time. The ‘Area Under the Curve’ metric or AUC is between 0.5 and 1, which means that it is reasonable goodness of fit.
+
+## 6.3 Cross validation
+
+We run a 100-fold cross validation here to avoid the biased causing by splitting the data.
+
+```{r CV_function, message=FALSE, warning=FALSE}
+ctrl <- trainControl(method = "cv", number = 100, classProbs=TRUE, summaryFunction=twoClassSummary)
+
+table3 <- table2 %>%  st_drop_geometry() 
+table3 <- table3 %>%                      
+   dplyr::mutate(results_numeric = ifelse(binary_results == 0 ,"fail","pass")) %>% na.omit()
+
+# sum(is.na(table3$binary_results))
+
+dat_cvFit <- train(results_numeric ~ .,
+                  data=table3 %>% 
+                    dplyr::select(risk, ratio_pass,first_time, sanitation_nn2, MedHHInc, MedRent, pctWhite, pctProverty_Cat,results_numeric),
+                method="glm", family="binomial",
+                metric="ROC", trControl = ctrl)
+
+dat_cvFit
+```
+
+```{r CV_results, message=FALSE, warning=FALSE,results=FALSE}
+dplyr::select(dat_cvFit$resample, -Resample) %>%
+  gather(metric, value) %>%
+  left_join(gather(dat_cvFit$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+    geom_histogram(bins=35, fill = "#FF006A") +
+    facet_wrap(~metric) +
+    geom_vline(aes(xintercept = mean), colour = "#981FAC", linetype = 3, size = 1.5) +
+    scale_x_continuous(limits = c(0, 1)) +
+    labs(x="Goodness of Fit", y="Count", title="CV Goodness of Fit Metrics",
+         subtitle = "Across-fold mean reprented as dotted lines")
+```
+
+The average of the AUC of the ROC is clustered arounf 0.75. The results of sensitivity and the specificity can be improved by switching the defaulted threshold as we did in Section 6.1. 
+
+# 7 Cost-Benefit Calculation and the thesholds
+
+We Would like to provide a use case of cost-Benefit calculation and show how we can improve the model by choosing the best threshold with the cost/benefit calculation results.
+
+(The cost/benefit data are not the real data - just a prediction to help illustrate how to improve the model)
+
+## 7.1 create cost/benefit table
+
+Assumption:
+
+Predict to fail the next inspections - spend $500 for the next inspections
+Predict to pass the next inspections - spend $100 for the next inspections
+A restaurant qualified the inspection criteria can serve the public by providing $800 benefits
+A restaurant unqualified the inspection criteria harm the public by $2000 cost (if not stopped by the government)
+
+True_Negative: Predict to fail the inspections, do fail the inspections
+               100% likelyhood to successfully protect the public from unsafe food (or other problems)
+               cost/ benefit: -$500 =$0 = $500
+
+True_Positive: predict to pass the inspections, do pass the inspections
+               cost/benefit: -$100 +$800 =$700     
+              
+False_Negative: Predict to fail the inspections, while in fact pass the inspections
+               cost/benefit: -$500 +$800 = $300
+               
+False_Positive:Predict to pass the inspections, while in fact fail the inspections
+               30% likelyhood to successfully protect the public from unsafe food (or other problems)
+               cost/benefit: -$100 + 0.3*$800 - 0.7*2000 = - $1260
+ 
+```{r cost_benefit, message=FALSE, warning=FALSE}
+cost_benefit_table <-
+   Pred_01 %>%
+      count(predOutcome, Outcome) %>%
+      summarize(True_Negative = sum((n[predOutcome==0 & Outcome==0]),na.rm = T),
+                True_Positive = sum((n[predOutcome==1 & Outcome==1]),na.rm = T),
+                False_Negative = sum((n[predOutcome==0 & Outcome==1]),na.rm = T),
+                False_Positive = sum((n[predOutcome==1 & Outcome==0]),na.rm = T)) %>%
+       gather(Variable, Count) %>%
+       mutate(Revenue =
+               case_when(Variable == "True_Negative"  ~ (-500)*Count,
+                         Variable == "True_Positive"  ~ (700) * Count,
+                         Variable == "False_Negative" ~ (300)* Count,
+                         Variable == "False_Positive" ~ (-1260) * Count)) %>%
+    bind_cols(data.frame(Description = c(
+              "We correctly predict a fail",
+              "We correctly predict a pass",
+              "We predict a fail but it should be a pass",
+              "We predict a pass but it should be a fail")))
+
+kable(cost_benefit_table,
+       caption = "Cost/Benefit Table") %>% kable_styling()
+```
+
+Here we have a clart of the cost/benefit of each category with a defaulted threshold (0.50)
+
+## 7.2 Optimize Thresholds
+
+### 7.2.1 Iterate thresholds
+
+```{r iterate_thresholds_2, message=FALSE, warning=FALSE,results=FALSE}
+iterateThresholds <- function(data, observedClass, predictedProbs, group) {
+#This function takes as its inputs, a data frame with an observed binomial class (1 or 0); a vector of predicted probabilities; and optionally a group indicator like race. It returns accuracy plus counts and rates of confusion matrix outcomes. It's a bit verbose because of the if (missing(group)). I don't know another way to make an optional parameter.
+  observedClass <- enquo(observedClass)
+  predictedProbs <- enquo(predictedProbs)
+  group <- enquo(group)
+  x = .01
+  all_prediction <- data.frame()
+  
+  if (missing(group)) {
+  
+    while (x <= 1) {
+    this_prediction <- data.frame()
+    
+    this_prediction <-
+      data %>%
+      mutate(predclass = ifelse(!!predictedProbs > x, 1,0)) %>%
+      count(predclass, !!observedClass) %>%
+      summarize(Count_TN = sum((n[predclass==0 & !!observedClass==0]),na.rm = T),
+                Count_TP = sum((n[predclass==1 & !!observedClass==1]),na.rm = T),
+                Count_FN = sum((n[predclass==0 & !!observedClass==1]),na.rm = T),
+                Count_FP = sum((n[predclass==1 & !!observedClass==0]),na.rm = T),
+                Rate_TP = Count_TP / (Count_TP + Count_FN),
+                Rate_FP = Count_FP / (Count_FP + Count_TN),
+                Rate_FN = Count_FN / (Count_FN + Count_TP),
+                Rate_TN = Count_TN / (Count_TN + Count_FP),
+                Accuracy = (Count_TP + Count_TN) / 
+                           (Count_TP + Count_TN + Count_FN + Count_FP)) %>%
+      mutate(Threshold = round(x,2))
+    
+    all_prediction <- rbind(all_prediction,this_prediction)
+    x <- x + .01
+  }
+  return(all_prediction)
+  }
+  else if (!missing(group)) { 
+   while (x <= 1) {
+    this_prediction <- data.frame()
+    
+    this_prediction <-
+      data %>%
+      mutate(predclass = ifelse(!!predictedProbs > x, 1,0)) %>%
+      group_by(!!group) %>%
+      count(predclass, !!observedClass) %>%
+      summarize(Count_TN = sum((n[predclass==0 & !!observedClass==0]),na.rm = T),
+                Count_TP = sum((n[predclass==1 & !!observedClass==1]),na.rm = T),
+                Count_FN = sum((n[predclass==0 & !!observedClass==1]),na.rm = T),
+                Count_FP = sum((n[predclass==1 & !!observedClass==0]),na.rm = T),
+                Rate_TP = Count_TP / (Count_TP + Count_FN),
+                Rate_FP = Count_FP / (Count_FP + Count_TN),
+                Rate_FN = Count_FN / (Count_FN + Count_TP),
+                Rate_TN = Count_TN / (Count_TN + Count_FP),
+                Accuracy = (Count_TP + Count_TN) / 
+                           (Count_TP + Count_TN + Count_FN + Count_FP)) %>%
+      mutate(Threshold = round(x,2))
+    
+    all_prediction <- rbind(all_prediction,this_prediction)
+    x <- x + .01
+  }
+  return(all_prediction)
+  }
+}
+```
+
+### 7.2.2 Plot the confusion metric outcomes for each threshold
+
+```{r coutcomes_thresholds, message=FALSE, warning=FALSE,results=FALSE}
+
+whichThreshold <- iterateThresholds(Pred_01,observedClass = Outcome, predictedProbs = Probs)
+
+whichThreshold <- 
+  whichThreshold %>%
+    dplyr::select(starts_with("Count"), Threshold) %>%
+    gather(Variable, Count, -Threshold) %>%
+    mutate(Revenue =
+                 case_when(Variable == "Count_TN"  ~ (-500)* Count,
+                           Variable == "Count_TP"  ~ (700)* Count,
+                           Variable == "Count_FN" ~ (300)* Count,
+                           Variable == "Count_FP" ~ (-1260) * Count))
+
+whichThreshold %>%
+  ggplot(.,aes(Threshold, Revenue, colour = Variable)) +
+  geom_point() +
+  scale_colour_manual(values = palette5[c(5, 1:3)]) +    
+  labs(title = "Profit by confusion matrix type and threshold",
+       y = "Profit") +
+  guides(colour=guide_legend(title = "Confusion Matrix"))  
+```
+
+From the chart, we can see how TN, TP, FP, and FN going up or down with the change of the threshold. Later we will sum up all these four categories as the total revenue.
+
+### 7.2.3 Threshold as a function of total revenue
+
+```{r thresholds_revenue, message=FALSE, warning=FALSE,results=FALSE}
+whichThreshold_revenue <- 
+  whichThreshold %>% 
+   group_by(Threshold) %>% 
+    summarize(Total_Revenue = sum((Revenue),na.rm = T)) 
+
+whichThreshold_revenue %>%
+  dplyr::select(Threshold, Total_Revenue) %>%
+  gather(Variable, Value, -Threshold) %>%
+  ggplot(aes(Threshold, Value, colour = Variable)) +
+    geom_point() +
+    geom_vline(xintercept = pull(arrange(whichThreshold_revenue, -Total_Revenue)[1,1])) +
+    labs(title = "Threshold as a function of total Revenue" )
+
+```
+
+
+From the figure, we can notice that if we set the threshold as 0.74, we are likely to get the highest revenue under over assumptions. We suggest that the Public Health Administration in Chicago can use their cost/benefit data to find out the best threshold and improve the inspection predict model. 
+
